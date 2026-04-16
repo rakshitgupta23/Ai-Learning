@@ -67,11 +67,6 @@ def get_embedding(text: str):
     return response.embeddings[0].values
 
 doc_embeddings = None
-memory_embeddings = []
-
-def store_memory_fact(fact: str):
-    emb = get_embedding(fact)
-    memory_embeddings.append((fact, emb))
 
 def init_embeddings():
     global doc_embeddings
@@ -85,24 +80,6 @@ def cosine_similarity(a, b):
     norm_a = math.sqrt(sum(x*x for x in a))
     norm_b = math.sqrt(sum(x*x for x in b))
     return dot / (norm_a * norm_b)
-
-def retrieve_memory(query: str, top_k=2):
-    if not memory_embeddings:
-        return []
-
-    query_emb = get_embedding(query)
-    scores = []
-
-    for fact, emb in memory_embeddings:
-        score = cosine_similarity(query_emb, emb)
-        scores.append((fact, score))
-
-    scores.sort(key=lambda x: x[1], reverse=True)
-
-    top_facts = [fact for fact, _ in scores[:top_k]]
-
-    print("Relevant memory:", top_facts)
-    return top_facts
 
 def retrieve(query: str):
     init_embeddings()
@@ -122,71 +99,44 @@ def retrieve(query: str):
     print("Retrieved documents:", top_docs)
     return top_docs
 
-chat_history = []
-user_memory = []
-
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze(request: AnalyzeRequest):
     text = request.text
-
+    # Step 1: validate input
     if not text or text.strip() == "":
         raise HTTPException(status_code=400, detail="Text cannot be empty")
+    attempt = 0
+    print("Received text to analyze:", text)
+    for attempt in range(2):
+    # Step 2: call llm
+        try:
+            rewritten_query = rewrite_query(text)
+            queries = generate_queries(rewritten_query)
 
-    print("Received:", text)
+            all_docs = []
 
-    # 1️⃣ Store user message
-    chat_history.append({"role": "user", "content": text})
+            for q in queries:
+                docs = retrieve(q)
+                all_docs.extend(docs)
 
-    # 2️⃣ Extract memory (ONLY if meaningful)
-    facts = extract_memory(text)
-    print("Extracted facts:", facts)
+            print("All retrieved docs:", all_docs)
 
-    for fact in facts:
-        if fact not in user_memory:
-            user_memory.append(fact)
-            store_memory_fact(fact)
+            unique_docs = list(set(all_docs))[:3]
+            print("Unique docs:", unique_docs)
 
-    print("User memory:", user_memory)
-    print("Chat history:", chat_history)
-
-    try:
-        # 3️⃣ Rewrite query
-        rewritten_query = rewrite_query(text)
-
-        # 4️⃣ Retrieve context
-        context = retrieve(rewritten_query)
-
-        relevant_memory = retrieve_memory(text)
-
-        # 5️⃣ Generate answer
-        raw = generate_answer(
-            query=text,
-            context=context,
-            history=chat_history,
-            memory=relevant_memory
-        )
-
-        # 6️⃣ Clean + parse
-        cleaned = clean_json(raw)
-        data = json.loads(cleaned)
-
-        # 7️⃣ Store assistant response (ONLY summary)
-        chat_history.append({
-            "role": "assistant",
-            "content": data["summary"]
-        })
-
-        print("Chat history after response:", chat_history)
-
-        return AnalyzeResponse(**data)
-
-    except Exception as e:
-        print("Error:", e)
-        return AnalyzeResponse(
-            summary="System failed",
-            confidence="low",
-            reason="Error occurred"
-        )
+            raw=call_llm(text, unique_docs)
+        # Step 3: parse output
+            cleaned = clean_json(raw)
+            data = json.loads(cleaned)
+        # Step 4: return response
+            return AnalyzeResponse(**data)
+        except ServerError:
+            print(f"Retrying due to 503... attempt {attempt+1}")
+            time.sleep(2)
+        except Exception as e:
+            print(f"Parsing failed attempt {attempt+1}")
+            print(f"Error: {e}")
+    return AnalyzeResponse(summary="Unable to analyze text", confidence="low", reason="LLM call failed after retries or output was unparsable")
 
 def clean_json(raw: str):
     raw = raw.strip()
@@ -197,42 +147,9 @@ def clean_json(raw: str):
 
     return raw
 
-def extract_memory(text: str):
-    try:
-        response = client.models.generate_content(
-            model="gemini-3.1-flash-lite-preview",
-            contents=f"""
-Extract important long-term user facts.
-
-Rules:
-- Only extract stable facts (health, goals, preferences)
-- Ignore questions
-- Return JSON
-
-Message:
-{text}
-
-Return:
-{{
-  "facts": ["..."]
-}}
-"""
-        )
-
-        cleaned = response.text.strip()
-
-        if cleaned.startswith("```"):
-            cleaned = cleaned.replace("```json", "").replace("```", "").strip()
-
-        data = json.loads(cleaned)
-        return data.get("facts", [])
-
-    except:
-        return []
-
 def rewrite_query(query: str):
     response = client.models.generate_content(
-        model="gemini-3.1-flash-lite-preview",
+        model="gemini-3.1-flash-lite",
         contents=f"""
 Rewrite the following user query to make it more clear and detailed 
 for semantic search. Do NOT answer it.
@@ -250,7 +167,7 @@ Return only the rewritten query.
 
 def generate_queries(query: str):
     response = client.models.generate_content(
-        model="gemini-3.1-flash-lite-preview",
+        model="gemini-3.1-flash-lite",
         contents=f"""
 Generate 3 DIFFERENT types of queries to improve retrieval.
 
@@ -275,37 +192,24 @@ Return a list(one query per line).
     print("Generated queries:", queries)
     return queries
 
-def generate_answer(query: str, context: list[str], history: list[dict], memory: list[str]):
+def call_llm(text: str, context: list[str]):
     try:
-        context_text = "\n\n".join(context)
+        # Step 1: retrieve relevant docs
+        context = "\n".join(context)
 
-        history_text = "\n".join(
-            [f"{msg['role']}: {msg['content']}" for msg in history[-5:]]
-        )
-
-        memory_text = "\n".join(memory)
-
+        # Step 2: call LLM
         response = client.models.generate_content(
-            model="gemini-3.1-flash-lite-preview",
+            model="gemini-3.1-flash-lite",
             contents=f"""
-User Memory:
-{memory_text}
-
-Conversation History:
-{history_text}
+Use the following context to answer:
 
 Context:
-{context_text}
+{context}
 
 Question:
-{query}
+{text}
 
-Instructions:
-- Use context if available
-- Use memory if relevant
-- If unsure, say low confidence
-
-Return ONLY JSON:
+Return ONLY valid JSON:
 {{
   "summary": "...",
   "confidence": "low | medium | high",
@@ -318,8 +222,9 @@ Return ONLY JSON:
         return response.text
 
     except Exception as e:
-        print("LLM Error:", e)
+        print("Gemini Error:", e)
         raise
+
 
 
 if __name__ == "__main__":
