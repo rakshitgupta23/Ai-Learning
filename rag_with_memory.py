@@ -69,12 +69,6 @@ def get_embedding(text: str):
 doc_embeddings = None
 memory_embeddings = []
 
-def calculator(expression: str):
-    try:
-        return str(eval(expression))
-    except:
-        return "Error"
-
 def store_memory_fact(fact: str):
     emb = get_embedding(fact)
     memory_embeddings.append((fact, emb))
@@ -156,22 +150,6 @@ def analyze(request: AnalyzeRequest):
     print("Chat history:", chat_history)
 
     try:
-        decision = decide_tool(text)
-
-        if decision["tool"] == "calculator":
-            result = calculator(decision.get("input", ""))
-            summary = f"The result is {result}"
-
-            chat_history.append({
-                "role": "assistant",
-                "content": summary
-            })
-
-            return AnalyzeResponse(
-                summary=summary,
-                confidence="high",
-                reason="Calculated using tool"
-            )
         # 3️⃣ Rewrite query
         rewritten_query = rewrite_query(text)
 
@@ -218,37 +196,6 @@ def clean_json(raw: str):
         raw = raw.replace("```json", "").replace("```", "").strip()
 
     return raw
-
-def decide_tool(query: str):
-    response = client.models.generate_content(
-        model="gemini-3.1-flash-lite-preview",
-        contents=f"""
-Decide if a tool is needed.
-
-Rules:
-- If it's a math calculation → use calculator
-- Otherwise → no tool
-
-Query:
-{query}
-
-Return JSON:
-{{
-  "tool": "calculator" | "none",
-  "input": "expression if needed"
-}}
-"""
-    )
-
-    cleaned = response.text.strip()
-
-    if cleaned.startswith("```"):
-        cleaned = cleaned.replace("```json", "").replace("```", "").strip()
-
-    try:
-        return json.loads(cleaned)
-    except:
-        return {"tool": "none"}
 
 def extract_memory(text: str):
     try:
