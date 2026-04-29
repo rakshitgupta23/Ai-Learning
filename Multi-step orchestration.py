@@ -1,4 +1,4 @@
-# Agent loop
+#Multi-step orchestration (planning → execution → combine)
 import time
 
 from fastapi import FastAPI, HTTPException
@@ -23,6 +23,8 @@ class AnalyzeRequest(BaseModel):
     text: str
 
 
+
+
 app = FastAPI()
 
 
@@ -32,42 +34,41 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 raw_documents = [
     """Apples are healthy and rich in fiber. They help digestion and improve gut health. 
     Regular consumption of apples may reduce risk of chronic diseases.""",
+
     """Soft drinks contain high sugar and are unhealthy. They are linked to obesity and diabetes. 
     Drinking too many sugary beverages can harm your body.""",
-    """Exercise improves cardiovascular health. It strengthens the heart and improves blood circulation. 
-    Regular physical activity reduces risk of heart disease.""",
-]
 
+    """Exercise improves cardiovascular health. It strengthens the heart and improves blood circulation. 
+    Regular physical activity reduces risk of heart disease."""
+]
 
 def chunk_text(text, chunk_size=8, overlap=3):
     words = text.split()
     chunks = []
 
     for i in range(0, len(words), chunk_size - overlap):
-        chunk = " ".join(words[i : i + chunk_size])
+        chunk = " ".join(words[i:i+chunk_size])
         chunks.append(chunk)
 
     return chunks
-
 
 documents = []
 
 for doc in raw_documents:
     documents.extend(chunk_text(doc))
 
-
 def get_embedding(text: str):
     response = client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=text,
-        config={"output_dimensionality": 768},
-    )
+    model="gemini-embedding-001",
+    contents=text,
+    config={
+        "output_dimensionality": 768
+    }
+)
     return response.embeddings[0].values
-
 
 doc_embeddings = None
 memory_embeddings = []
-
 
 def calculator(expression: str):
     try:
@@ -75,27 +76,22 @@ def calculator(expression: str):
     except:
         return "Error"
 
-
 def store_memory_fact(fact: str):
     emb = get_embedding(fact)
     memory_embeddings.append((fact, emb))
-
 
 def init_embeddings():
     global doc_embeddings
     if doc_embeddings is None:
         doc_embeddings = [(doc, get_embedding(doc)) for doc in documents]
 
-
 import math
 
-
 def cosine_similarity(a, b):
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
+    dot = sum(x*y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x*x for x in a))
+    norm_b = math.sqrt(sum(x*x for x in b))
     return dot / (norm_a * norm_b)
-
 
 def retrieve_memory(query: str, top_k=2):
     if not memory_embeddings:
@@ -115,7 +111,6 @@ def retrieve_memory(query: str, top_k=2):
     print("Relevant memory:", top_facts)
     return top_facts
 
-
 def retrieve(query: str):
     init_embeddings()
     query_emb = get_embedding(query)
@@ -134,10 +129,8 @@ def retrieve(query: str):
     print("Retrieved documents:", top_docs)
     return top_docs
 
-
 chat_history = []
 user_memory = []
-
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze(request: AnalyzeRequest):
@@ -151,7 +144,7 @@ def analyze(request: AnalyzeRequest):
     # 1️⃣ Store user message
     chat_history.append({"role": "user", "content": text})
 
-    # 2️⃣ Extract memory
+    # 2️⃣ Extract memory (ONLY if meaningful)
     facts = extract_memory(text)
     print("Extracted facts:", facts)
 
@@ -164,60 +157,61 @@ def analyze(request: AnalyzeRequest):
     print("Chat history:", chat_history)
 
     try:
-        # 🔥 AGENT LOOP STARTS HERE
-        steps_taken = []
+        steps = plan_steps(text)
         results = []
-        confidences = []
-        reasons = []
-        last_result = ""
 
-        max_steps = 5
+        for step in steps:
+            step_type = step.get("type", "").strip().lower()
+            step_input = step.get("input", text)
 
-        for i in range(max_steps):
-            decision = agent_decide(text, steps_taken, last_result)
+            print("Executing step:", step_type, "|", step_input)
 
-            action = decision.get("action", "").strip().lower()
-            step_input = decision.get("input", "")
+            # 🧮 MATH STEP
+            if step_type == "math":
+                result = calculator(step_input)
+                results.append(f"Math result: {result}")
 
-            print(f"Step {i+1} decision:", decision)
+            # 🧠 KNOWLEDGE STEP
+            elif step_type == "knowledge":
+                rewritten_query = rewrite_query(step_input)
+                context = retrieve(rewritten_query)
+                relevant_memory = retrieve_memory(step_input)
 
-            if action == "done":
-                break
+                raw = generate_answer(
+                    query=step_input,
+                    context=context,
+                    history=chat_history,
+                    memory=relevant_memory
+                )
 
-            step = {"tool": action, "input": step_input}
+                cleaned = clean_json(raw)
+                data = json.loads(cleaned)
 
-            result = execute_step(step, chat_history)
+                results.append(data["summary"])
 
-            steps_taken.append(step)
-            results.append(result["summary"])
-            confidences.append(result["confidence"])
-            reasons.append(result["reason"])
-
-            last_result = result
-
-        # 🔥 FINAL ANSWER
+        # 🔥 COMBINE RESULTS
         final_answer = " | ".join(results)
 
-        final_confidence = "low"
-        if all(c == "high" for c in confidences):
-            final_confidence = "high"
-        elif any(c == "medium" for c in confidences):
-            final_confidence = "medium"
+        chat_history.append({
+            "role": "assistant",
+            "content": final_answer
+        })
 
-        final_reason = " | ".join(reasons)
-
-        chat_history.append({"role": "assistant", "content": final_answer})
+        print("Final answer:", final_answer)
 
         return AnalyzeResponse(
-            summary=final_answer, confidence=final_confidence, reason=final_reason
+            summary=final_answer,
+            confidence="high",
+            reason="Multi-step execution"
         )
 
     except Exception as e:
         print("Error:", e)
         return AnalyzeResponse(
-            summary="System failed", confidence="low", reason="Error occurred"
+            summary="System failed",
+            confidence="low",
+            reason="Error occurred"
         )
-
 
 def clean_json(raw: str):
     raw = raw.strip()
@@ -228,63 +222,43 @@ def clean_json(raw: str):
 
     return raw
 
+def plan_steps(query: str):
+    response = client.models.generate_content(
+        model="gemini-3.1-flash-lite-preview",
+        contents=f"""
+Break the user query into steps.
 
-tools = [
-    {
-        "name": "calculator",
-        "description": "Performs mathematical calculations like addition, multiplication, division",
-        "input_format": "A valid math expression like 2+2 or 10*5",
-    },
-    {
-        "name": "rag",
-        "description": "Answers general knowledge questions using context and retrieval",
-        "input_format": "A natural language question",
-    },
-]
+Rules:
+- If math calculation → type = "math"
+- If general question → type = "knowledge"
+- Can return multiple steps
 
+Query:
+{query}
 
-def format_tools():
-    return "\n".join(
-        [
-            f"{tool['name']}: {tool['description']} (input: {tool['input_format']})"
-            for tool in tools
-        ]
+Return JSON:
+{{
+  "steps": [
+    {{
+      "type": "math" | "knowledge",
+      "input": "..."
+    }}
+  ]
+}}
+"""
     )
 
+    cleaned = response.text.strip()
 
-def execute_step(step, chat_history):
-    tool = step.get("tool", "").strip().lower()
-    step_input = step.get("input", "")
+    if cleaned.startswith("```"):
+        cleaned = cleaned.replace("```json", "").replace("```", "").strip()
 
-    print("Executing tool:", tool, "| input:", step_input)
-
-    if tool == "calculator":
-        return f"Math result: {calculator(step_input)}"
-
-    elif tool == "rag":
-        rewritten_query = rewrite_query(step_input)
-        context = retrieve(rewritten_query)
-        relevant_memory = retrieve_memory(step_input)
-
-        try:
-            raw = generate_answer(
-                query=step_input,
-                context=context,
-                history=chat_history,
-                memory=relevant_memory,
-            )
-
-            cleaned = clean_json(raw)
-            data = json.loads(cleaned)
-
-            return data
-
-        except:
-            return "Could not fetch knowledge"
-
-    else:
-        return f"Unknown tool: {tool}"
-
+    try:
+        data = json.loads(cleaned)
+        print("Planned steps:", data["steps"])
+        return data["steps"]
+    except:
+        return [{"type": "knowledge", "input": query}]
 
 def extract_memory(text: str):
     try:
@@ -305,7 +279,7 @@ Return:
 {{
   "facts": ["..."]
 }}
-""",
+"""
         )
 
         cleaned = response.text.strip()
@@ -319,7 +293,6 @@ Return:
     except:
         return []
 
-
 def rewrite_query(query: str):
     response = client.models.generate_content(
         model="gemini-3.1-flash-lite-preview",
@@ -331,13 +304,12 @@ Query:
 {query}
 
 Return only the rewritten query.
-""",
+"""
     )
 
     rewritten = response.text.strip()
     print("Rewritten query:", rewritten)
     return rewritten
-
 
 def generate_queries(query: str):
     response = client.models.generate_content(
@@ -357,7 +329,7 @@ Query:
 {query}
 
 Return a list(one query per line).
-""",
+"""
     )
 
     queries = response.text.strip().split("\n")
@@ -366,10 +338,7 @@ Return a list(one query per line).
     print("Generated queries:", queries)
     return queries
 
-
-def generate_answer(
-    query: str, context: list[str], history: list[dict], memory: list[str]
-):
+def generate_answer(query: str, context: list[str], history: list[dict], memory: list[str]):
     try:
         context_text = "\n\n".join(context)
 
@@ -405,7 +374,7 @@ Return ONLY JSON:
   "confidence": "low | medium | high",
   "reason": "..."
 }}
-""",
+"""
         )
 
         print(response.text)
@@ -416,53 +385,11 @@ Return ONLY JSON:
         raise
 
 
-def agent_decide(query, steps_taken, last_result):
-    tool_desc = format_tools()
-
-    response = client.models.generate_content(
-        model="gemini-3.1-flash-lite-preview",
-        contents=f"""
-You are an intelligent agent that solves problems step by step.
-
-Available tools:
-{tool_desc}
-
-User query:
-{query}
-
-Steps already taken:
-{steps_taken}
-
-Last result:
-{last_result}
-
-Rules:
-- Break complex queries into MULTIPLE steps
-- Do NOT solve everything in one step
-- Each step should handle ONLY ONE part of the problem
-- If multiple intents exist → handle them one by one
-- Only return DONE when ALL parts are handled
-
-Return JSON:
-{{
-  "action": "tool_name" | "DONE",
-  "input": "..."
-}}
-""",
-    )
-
-    cleaned = response.text.strip()
-
-    if cleaned.startswith("```"):
-        cleaned = cleaned.replace("```json", "").replace("```", "").strip()
-
-    try:
-        return json.loads(cleaned)
-    except:
-        return {"action": "DONE"}
-
-
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run(
+        "main:app",       
+        host="127.0.0.1",
+        port=8000,
+        reload=True        
+    )
