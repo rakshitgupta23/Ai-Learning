@@ -1,4 +1,4 @@
-# Agent loop
+# Agent loop + Self evaluation and correction
 import time
 
 from fastapi import FastAPI, HTTPException
@@ -186,14 +186,43 @@ def analyze(request: AnalyzeRequest):
 
             step = {"tool": action, "input": step_input}
 
-            result = execute_step(step, chat_history)
+            # 🔁 retry mechanism
+            retry_count = 0
+            max_retry = 2
+
+            while retry_count <= max_retry:
+                result = execute_step(step, chat_history)
+
+                # handle failure case
+                if isinstance(result, str):
+                    retry_count += 1
+                    continue
+
+                # 🔍 evaluate result
+                evaluation = evaluate_step(text, step_input, result["summary"])
+
+                print("Evaluation:", evaluation)
+
+                if evaluation.get("valid", True):
+                    break
+                else:
+                    print("Retrying step...")
+                    retry_count += 1
+
+            # if still bad after retries
+            if isinstance(result, str):
+                result = {
+                    "summary": "Failed to get reliable answer",
+                    "confidence": "low",
+                    "reason": "Tool repeatedly failed"
+                }
 
             steps_taken.append(step)
             results.append(result["summary"])
             confidences.append(result["confidence"])
             reasons.append(result["reason"])
 
-            last_result = result
+            last_result = result["summary"]
 
         # 🔥 FINAL ANSWER
         final_answer = " | ".join(results)
@@ -460,6 +489,46 @@ Return JSON:
         return json.loads(cleaned)
     except:
         return {"action": "DONE"}
+    
+def evaluate_step(query, step_input, result):
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.1-flash-lite-preview",
+            contents=f"""
+You are evaluating ONE step of a multi-step reasoning system.
+
+User query:
+{query}
+
+Current step input:
+{step_input}
+
+Step result:
+{result}
+
+Rules:
+- Evaluate ONLY this step
+- Do NOT check entire query
+- Check if this step correctly answers its own input
+- Ignore missing parts of the full query
+
+Return JSON:
+{{
+  "valid": true | false,
+  "reason": "..."
+}}
+"""
+        )
+
+        cleaned = response.text.strip()
+
+        if cleaned.startswith("```"):
+            cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+
+        return json.loads(cleaned)
+
+    except:
+        return {"valid": True}
 
 
 if __name__ == "__main__":
